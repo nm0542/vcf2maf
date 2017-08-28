@@ -8,6 +8,28 @@ use IO::File;
 use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
 
+
+#Preprocess header part- only info fields
+sub ext_header{
+my $fname = $_[0]; 
+
+open(my $fh, '<:encoding(UTF-8)', $fname) or die "Could not open file '$fname' $!";
+
+my ($header , $id , $type, $desc, $num) = ""; 
+while (my $row = <$fh>)
+{
+  chomp $row; 
+  $row =~ s/[\r\n]+$//;
+  ($id, $type, $desc) = split ("\t+", $row);
+  if ($type eq 'Flag'){$num = "0";}
+  else {$num = ".";}  
+  $header .= ("##INFO=<ID=$id,Number=$num,Type=$type,Description=\"$desc\">\n"); 
+}  
+
+  return $header
+}
+
+
 # Set any default paths and constants
 my $ref_fasta = "$ENV{HOME}/.vep/homo_sapiens/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
 my ( $tum_depth_col, $tum_rad_col, $tum_vad_col ) = qw( t_depth t_ref_count t_alt_count );
@@ -53,11 +75,8 @@ unless( defined $output_vcf ) {
 
 # Before anything, let's parse the headers of this supposed "MAF-like" file and do some checks
 my $maf_fh = IO::File->new( $input_maf ) or die "ERROR: Couldn't open input MAF: $input_maf!\n";
-my ( %uniq_regions, %filter_tags, %flanking_bps, @tn_pair, %col_idx, $header_line );
+my ( %uniq_regions, %flanking_bps, @tn_pair, %col_idx, $header_line );
 while( my $line = $maf_fh->getline ) {
-
-    # If the file uses Mac OS 9 newlines, quit with an error
-    ( $line !~ m/\r$/ ) or die "ERROR: Your MAF uses CR line breaks, which we can't support. Please use LF or CRLF.\n";
 
     # Skip comment lines
     next if( $line =~ m/^#/ );
@@ -78,7 +97,7 @@ while( my $line = $maf_fh->getline ) {
         # Fetch all tumor-normal paired IDs from the MAF, doing some whitespace cleanup in the same step
         my $tn_idx = $col_idx{tumor_sample_barcode} + 1;
         $tn_idx .= ( "," . ( $col_idx{matched_norm_sample_barcode} + 1 )) if( defined $col_idx{matched_norm_sample_barcode} );
-        @tn_pair = map{s/^\s+|\s+$|\r|\n//g; s/\s*\t\s*/\t/; $_}`grep -aEiv "^#|^Hugo_Symbol|^Chromosome|^Tumor_Sample_Barcode" $input_maf | cut -f $tn_idx | sort -u`;
+        @tn_pair = map{s/^\s+|\s+$|\r|\n//g; s/\s*\t\s*/\t/; $_}`grep -Eiv "^#|^Hugo_Symbol|^Chromosome|^Tumor_Sample_Barcode" $input_maf | cut -f $tn_idx | sort -u`;
 
         # Quit if one of the TN barcodes are missing, or they contain characters not allowed in Unix filenames
         map{ ( !m/^\s*$|^#|\0|\// ) or die "ERROR: Invalid Tumor_Sample_Barcode in MAF: \"$_\"\n"} @tn_pair;
@@ -89,12 +108,10 @@ while( my $line = $maf_fh->getline ) {
     ( %col_idx ) or die "ERROR: Couldn't find a header line (must start with Hugo_Symbol, Chromosome, or Tumor_Sample_Barcode): $input_maf\n";
 
     # For each variant in the MAF, parse out the locus for running samtools faidx later
-    my ( $chr, $pos, $ref, $filter ) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele FILTER );
+    my ( $chr, $pos, $ref ) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele );
     $ref =~ s/^(\?|-|0)+$//; # Blank out the dashes (or other weird chars) used with indels
     my $region = "$chr:" . ( $pos - 1 ) . "-" . ( $pos + length( $ref ));
     $uniq_regions{$region} = 1;
-    # Also track the unique FILTER tags seen, so we can construct VCF header lines for each
-    map{ $filter_tags{$_} = 1 unless( $_ eq "PASS" or $_ eq "." )} split( /,|;/, $filter );
 }
 $maf_fh->close;
 
@@ -121,7 +138,7 @@ foreach my $line ( grep( length, split( ">", $lines ))) {
 $maf_fh = IO::File->new( $input_maf ) or die "ERROR: Couldn't open file: $input_maf\n";
 my %tn_vcf = (); # In-memory cache to speed up writing per-TN pair VCFs
 my $skipped_fh; # If any variants have ref mismatch issues, skip and store them separately
-my ( @var_key, %var_frmt, %var_fltr, %var_id, %var_qual ); # Retain variant info for printing later
+my ( @var_key, %var_frmt, %var_fltr, %var_id, %var_qual, %var_inf  ); # Retain variant info for printing later
 my %vcf_col_idx = (); # Tracks the position of genotype columns for each sample
 my $line_count = 0;
 
@@ -151,10 +168,13 @@ while( my $line = $maf_fh->getline ) {
             if( $per_tn_vcfs ) {
                 my $vcf_file = "$output_dir/$t_id\_vs_$n_id.vcf";
                 $tn_vcf{$vcf_file} .= "##fileformat=VCFv4.2\n";
+                my $fname = '/home/nmemon/Genie_Data/maf_fields_tokeep.txt';
+                $tn_vcf{$vcf_file} .= ext_header($fname); 
                 $tn_vcf{$vcf_file} .= "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
                 $tn_vcf{$vcf_file} .= "##FORMAT=<ID=AD,Number=G,Type=Integer,Description=\"Allelic depths of REF and ALT(s) in the order listed\">\n";
                 $tn_vcf{$vcf_file} .= "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Total read depth across this site\">\n";
-                $tn_vcf{$vcf_file} .= "##FILTER=<ID=$_,Description=\"\">\n" foreach ( sort keys %filter_tags );
+
+
                 $tn_vcf{$vcf_file} .= "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t$t_id\t$n_id\n";
             }
 
@@ -168,7 +188,14 @@ while( my $line = $maf_fh->getline ) {
     }
 
     # For each variant in the MAF, parse out data that can go into the output VCF
-    my ( $chr, $pos, $ref, $al1, $al2, $t_id, $n_id, $n_al1, $n_al2, $id, $qual, $filter ) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele Tumor_Seq_Allele1 Tumor_Seq_Allele2 Tumor_Sample_Barcode Matched_Norm_Sample_Barcode Match_Norm_Seq_Allele1 Match_Norm_Seq_Allele2 variant_id variant_qual FILTER );
+    my ( $chr, $pos, $ref, $al1, $al2, $t_id, $n_id, $n_al1, $n_al2, $id, $qual, $filter, $hugo_symbol, $entrez_gene_id, $strand, $variant_classification, $variant_type, $dbsnp_rs, $dbsnp_val_status, $transcript_id, $exon_number, $t_depth, $t_ref_count, $t_alt_count, $n_depth, $n_ref_count, $n_alt_count, $all_effects, $consequence, $existing_variation, $trembl, $uniparc, $refseq, $sift, $polyphen, $afr_maf, $amr_maf, $asn_maf, $eas_maf, $eur_maf, $sas_maf, $aa_maf, $ea_maf, $clin_sig, $somatic, $pubmed, $impact, $variant_class, $tsl, $exac_af, $exac_af_afr, $exac_af_amr, $exac_af_eas, $exac_af_fin, $exac_af_nfe, $exac_af_oth, $exac_af_sas, $gene_pheno, $exac_af_adj, $exac_ac_an_adj, $exac_ac_an, $exac_ac_an_afr, $exac_ac_an_amr, $exac_ac_an_eas, $exac_ac_an_fin, $exac_ac_an_nfe, $exac_ac_an_oth, $exac_ac_an_sas, $exac_filter) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele Tumor_Seq_Allele1 Tumor_Seq_Allele2 Tumor_Sample_Barcode Matched_Norm_Sample_Barcode Match_Norm_Seq_Allele1 Match_Norm_Seq_Allele2 variant_id variant_qual FILTER Hugo_Symbol Entrez_Gene_Id Strand Variant_Classification Variant_Type dbSNP_RS dbSNP_Val_Status Transcript_ID Exon_Number t_depth t_ref_count t_alt_count n_depth n_ref_count n_alt_count all_effects Consequence Existing_variation TREMBL UNIPARC RefSeq SIFT PolyPhen AFR_MAF AMR_MAF ASN_MAF EAS_MAF EUR_MAF SAS_MAF AA_MAF EA_MAF CLIN_SIG SOMATIC PUBMED IMPACT VARIANT_CLASS TSL ExAC_AF ExAC_AF_AFR ExAC_AF_AMR ExAC_AF_EAS ExAC_AF_FIN ExAC_AF_NFE ExAC_AF_OTH ExAC_AF_SAS GENE_PHENO ExAC_AF_Adj ExAC_AC_AN_Adj ExAC_AC_AN ExAC_AC_AN_AFR ExAC_AC_AN_AMR ExAC_AC_AN_EAS ExAC_AC_AN_FIN ExAC_AC_AN_NFE ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER);
+
+
+    #preprocess info values and their mappings
+    my %info = ('Hugo_Symbol' => $hugo_symbol, 'Entrez_Gene_Id' => $entrez_gene_id, 'Strand' => $strand, 'Variant_Classification' => $variant_classification, 'Variant_Type' => $variant_type, 'dbSNP_RS'=> $dbsnp_rs,'dbSNP_Val_Status' => $dbsnp_val_status, 'Transcript_ID' => $transcript_id, 'Exon_Number' => $exon_number, 't_depth' => $t_depth,'t_ref_count' => $t_ref_count, 't_alt_count' => $t_alt_count, 'n_depth' => $n_depth, 'n_ref_count' => $n_ref_count, 'n_alt_count' => $n_alt_count, 'all_effects' => $all_effects, 'Consequence' => $consequence, 'Existing_variation' => $existing_variation, 'TREMBL' => $trembl, 'UNIPARC' => $uniparc, 'RefSeq' => $refseq, 'SIFT' => $sift, 'PolyPhen' => $polyphen, 'AFR_MAF'=> $afr_maf, 'AMR_MAF' => $amr_maf,'ASN_MAF' => $asn_maf, 'EAS_MAF'=> $eas_maf, 'EUR_MAF'=> $eur_maf, 'SAS_MAF'=> $sas_maf, 'AA_MAF'=> $aa_maf, 'EA_MAF'=> $ea_maf, 'CLIN_SIG'=> $clin_sig, 'SOMATIC' => $somatic, 'PUBMED' => $pubmed,'IMPACT' => $impact,'VARIANT_CLASS'=> $variant_class, 'TSL' => $tsl,'ExAC_AF' => $exac_af,'ExAC_AF_AFR' => $exac_af_afr, 'ExAC_AF_AMR' => $exac_af_amr, 'ExAC_AF_EAS' => $exac_af_eas,'ExAC_AF_FIN' => $exac_af_fin, 'ExAC_AF_NFE' => $exac_af_nfe, 'ExAC_AF_OTH' => $exac_af_oth, 'ExAC_AF_SAS' => $exac_af_sas, 'GENE_PHENO' => $gene_pheno, 'ExAC_AF_Adj' => $exac_af_adj, 'ExAC_AC_AN_Adj'=> $exac_ac_an_adj, 'ExAC_AC_AN' => $exac_ac_an, 'ExAC_AC_AN_AFR' => $exac_ac_an_afr, 'ExAC_AC_AN_AMR' => $exac_ac_an_amr, 'ExAC_AC_AN_EAS' => $exac_ac_an_eas, 'ExAC_AC_AN_FIN' => $exac_ac_an_fin, 'ExAC_AC_AN_NFE' => $exac_ac_an_nfe, 'ExAC_AC_AN_OTH' => $exac_ac_an_oth, 'ExAC_AC_AN_SAS' => $exac_ac_an_sas, 'ExAC_FILTER'=> $exac_filter); 
+
+   
+            
     ++$line_count;
 
     # Handle a situation in Oncotator MAFs where alleles of DNPs are pipe "|" delimited:
@@ -184,10 +211,20 @@ while( my $line = $maf_fh->getline ) {
     # Normal sample ID could be undefined for legit reasons, but we need a placeholder name
     $n_id = "NORMAL" if( !defined $n_id or $n_id eq "" );
 
-    # If VCF ID, QUAL, or FILTER are undefined or empty, set them to "." per proper VCF specs
+    # If VCF ID, QUAL, FILTER or Some InFO fields are undefined or empty, set them to "." per proper VCF specs
     $id = "." if( !defined $id or $id eq "" );
     $qual = "." if( !defined $qual or $qual eq "" );
     $filter = "." if( !defined $filter or $filter eq "" );
+    $info{'Hugo_Symbol'} = "Unknown" if( !defined $info{'Hugo_Symbol'} or $info{'Hugo_Symbol'} eq "" );
+    $info{'Entrez_Gene_Id'} = 0 if(!defined $info{'Entrez_Gene_Id'}  or $info{'Entrez_Gene_Id'} eq "" ); 
+    $info{'SOMATIC'} = "null" if(!defined $info{'SOMATIC'}  or $info{'SOMATIC'} eq "" );
+    $info{'GENE_PHENO'} = "null" if(!defined $info{'GENE_PHENO'}  or $info{'GENE_PHENO'} eq "" );
+
+     #del the other undef info field 
+     while (my ($key, $val) = each %info) {
+            if (!defined $val or $val eq ""){
+            delete $info{$key};}
+            }
 
     # If normal alleles are unset in the MAF (quite common), assume homozygous reference
     $n_al1 = $ref if( $n_al1 eq "" );
@@ -270,11 +307,20 @@ while( my $line = $maf_fh->getline ) {
     # Construct genotype fields for FORMAT tags GT:AD:DP
     my $t_fmt = "$t_gt:$t_rad,$t_vad:$t_dp";
     my $n_fmt = "$n_gt:$n_rad,$n_vad:$n_dp";
-
+    
+    #Construct info fields 
+    my $str_inf = "";   
+    while (my ($key, $val) = each %info) {
+       $str_inf .= "$key=$val\;";                     
+     }
+      
+    #del last ';'
+    chop $str_inf;
+      
     # Contruct a VCF formatted line and append it to the respective VCF
     if( $per_tn_vcfs ) {
         my $vcf_file = "$output_dir/$t_id\_vs_$n_id.vcf";
-        my $vcf_line = join( "\t", $chr, $pos, $id, $ref, $alt, $qual, $filter, ".", "GT:AD:DP", $t_fmt, $n_fmt );
+        my $vcf_line = join( "\t", $chr, $pos, $id, $ref, $alt, $qual, $filter, $str_inf, "GT:AD:DP", $t_fmt, $n_fmt );         
         $tn_vcf{$vcf_file} .= "$vcf_line\n";
     }
 
@@ -285,6 +331,7 @@ while( my $line = $maf_fh->getline ) {
     $var_frmt{ $key }{ $vcf_col_idx{ $n_id }} = $n_fmt;
     # ::NOTE:: Samples shouldn't have different ID, QUAL, or FILTERs for the same loci+alleles
     $var_fltr{ $key } = $filter;
+    $var_inf{ $key } = $str_inf;
     $var_id{ $key } = $id;
     $var_qual{ $key } = $qual;
 }
@@ -304,16 +351,17 @@ if( $per_tn_vcfs ) {
 my @vcf_cols = sort { $vcf_col_idx{$a} <=> $vcf_col_idx{$b} } keys %vcf_col_idx;
 my $vcf_fh = IO::File->new( $output_vcf, ">" ) or die "ERROR: Fail to create file $output_vcf\n";
 $vcf_fh->print( "##fileformat=VCFv4.2\n" );
+my $fname = '/home/nmemon/Genie_Data/maf_fields_tokeep.txt'; 
+$vcf_fh->print(ext_header($fname)); 
 $vcf_fh->print( "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n" );
 $vcf_fh->print( "##FORMAT=<ID=AD,Number=G,Type=Integer,Description=\"Allelic Depths of REF and ALT(s) in the order listed\">\n" );
 $vcf_fh->print( "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n" );
-$vcf_fh->print( "##FILTER=<ID=$_,Description=\"\">\n" ) foreach ( sort keys %filter_tags );
 $vcf_fh->print( "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" . join("\t", @vcf_cols) . "\n" );
 
 # Write each variant into the multi-sample VCF
 foreach my $key ( @var_key ) {
     my ( $chr, $pos, $ref, $alt ) = split( "\t", $key );
-    $vcf_fh->print( join( "\t", $chr, $pos, $var_id{ $key }, $ref, $alt, $var_qual{ $key }, $var_fltr{ $key }, ".", "GT:AD:DP" ));
+    $vcf_fh->print( join( "\t", $chr, $pos, $var_id{ $key }, $ref, $alt, $var_qual{ $key }, $var_fltr{ $key }, $var_inf{ $key } , "GT:AD:DP" ));
     map{ $vcf_fh->print( "\t" . (( exists $var_frmt{$key}{$_} ) ? $var_frmt{$key}{$_} : './.:.:.' ))}( 0..$#vcf_cols );
     $vcf_fh->print( "\n" );
 }
